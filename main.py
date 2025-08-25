@@ -2,10 +2,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os, base64, mimetypes, json
 from openai import OpenAI
+import httpx  # ✅ pour capter les timeouts réseau
 
 app = FastAPI(title="Garantix Extract API")
 
-# CORS (utile pour dev/app mobile)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,16 +14,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Clé OpenAI depuis l'env Render (Settings → Environment → OPENAI_API_KEY)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ✅ Timeout plus court (Render coupe souvent après ~100s)
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    timeout=45.0,        # secondes (request total)
+    max_retries=1
+)
 
-@app.get("/")
-def hello():
-    return {"status": "ok", "message": "Garantix backend en ligne 🎉"}
-
-@app.get("/health")
-def health():
-    return {"ok": True}
+MAX_UPLOAD_BYTES = 6 * 1024 * 1024  # ~6 Mo pour éviter 502 sur gros PDF/images
 
 def to_data_url(content: bytes, filename: str) -> str:
     mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -33,21 +31,24 @@ def to_data_url(content: bytes, filename: str) -> str:
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     try:
-        # --- Lecture & vérifs basiques ---
         blob = await file.read()
         if not blob:
             raise HTTPException(status_code=400, detail="Empty file")
 
+        # ✅ garde une borne haute (Render/Cloudflare n’aiment pas les très gros bodies)
+        if len(blob) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({len(blob)//1024} KB). Try a file under {MAX_UPLOAD_BYTES//1024} KB."
+            )
+
         api_key = os.getenv("OPENAI_API_KEY") or ""
-        if not api_key or not api_key.startswith(("sk-", "sk-proj-")):
-            # on log côté serveur
-            print("❌ OPENAI_API_KEY manquant ou invalide")
+        if not api_key.startswith(("sk-", "sk-proj-")):
+            print("❌ OPENAI_API_KEY manquant/invalide")
             raise HTTPException(status_code=500, detail="Server misconfigured (OPENAI_API_KEY)")
 
-        # --- Encodage image/PDF ---
         data_url = to_data_url(blob, file.filename)
 
-        # --- Prompt & appel OpenAI ---
         prompt = (
             "Analyse cette facture française. Retourne UNIQUEMENT un JSON avec: "
             "seller{name,legal_name,vat_id,siret,address,email,website}; "
@@ -80,9 +81,10 @@ async def extract(file: UploadFile = File(...)):
         return {"data": parsed}
 
     except HTTPException:
-        # On laisse passer tel quel
         raise
+    except (httpx.TimeoutException, httpx.ReadTimeout) as e:
+        print("⏱️ Timeout OpenAI:", repr(e))
+        raise HTTPException(status_code=504, detail="Upstream timeout (try a smaller/clearer file)")
     except Exception as e:
-        # On log côté serveur (visible dans Render Logs) ET on retourne un message clair
         print("❌ OpenAI/Server error:", repr(e))
         raise HTTPException(status_code=500, detail=f"Upstream error: {str(e)}")
