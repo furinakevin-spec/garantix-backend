@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os, base64, mimetypes, json
 from openai import OpenAI
-import httpx  # pour gérer proprement les timeouts réseau
+import httpx  # timeouts réseau
 
 app = FastAPI(title="Garantix Extract API")
 
@@ -17,13 +17,13 @@ app.add_middleware(
 
 # ——— Réglages sécurité/fiabilité ———
 MAX_UPLOAD_BYTES = 6 * 1024 * 1024  # ~6 Mo (évite 502 sur gros PDF/images)
-OPENAI_MODEL = "gpt-4.1-mini"       # utilisé si l'API Responses est dispo (vision)
-FALLBACK_MODEL = "gpt-4o-mini"      # utilisé pour chat.completions (vision)
+OPENAI_MODEL = "gpt-4.1-mini"       # pour Responses (vision support)
+FALLBACK_MODEL = "gpt-4o-mini"      # pour Chat Completions (vision)
 
 # Client OpenAI avec timeout raisonnable pour Render
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    timeout=45.0,   # secondes (total request)
+    timeout=45.0,   # secondes
     max_retries=1
 )
 
@@ -42,16 +42,43 @@ def to_data_url(content: bytes, filename: str) -> str:
     b64 = base64.b64encode(content).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
+def mock_payload():
+    # ⚠️ Exemple fictif — adapte-le si besoin
+    return {
+        "data": {
+            "seller": {"name": "TEXIPOOL SASU", "legal_name": None, "vat_id": "FR89502939432",
+                       "siret": "50293943200014", "address": "Rue de l'océan 44390 Nort-sur-Erdre",
+                       "email": "commandes@baches-piscines.com", "website": "https://www.baches-piscines.com"},
+            "purchase_date": "2025-08-20",
+            "currency": "EUR",
+            "totals": {"subtotal_ht": 648.87, "tva_rate": 20, "tva_amount": 129.77, "total_ttc": 778.64},
+            "items": [
+                {"product_name": "Enrouleur piscine 3-5 m Alpha axe 80mm", "sku": "A280167",
+                 "qty": 1, "unit_price": 190.0, "line_total": 190.0,
+                 "product_photo_url": None, "warranty": {"duration_months": 24, "notes": "2 ans"},
+                 "confidence": 0.93},
+                {"product_name": "Bâche bulles 500µ Noir Energy Guard Geobubble", "sku": "BBNOIRNET",
+                 "qty": 1, "unit_price": 530.96, "line_total": 530.96,
+                 "product_photo_url": None, "warranty": {"duration_months": 48, "notes": "4 ans"},
+                 "confidence": 0.88}
+            ],
+            "invoice_number": "290144",
+            "order_number": "299258",
+            "payment_method": "PayPal",
+            "confidence": 0.92
+        }
+    }
+
 def call_openai_vision_json(data_url: str, prompt: str) -> str:
     """
-    Tente d'abord l'API Responses (si dispo), sinon fallback sur Chat Completions (vision).
+    Tente d'abord l'API Responses (si dispo), sinon fallback Chat Completions (vision).
     Retourne une string JSON (ou lève une exception).
     """
     # 1) Chemin Responses (OpenAI SDK v1.x récent)
     try:
         if hasattr(client, "responses"):
             r = client.responses.create(
-                model=OPENAI_MODEL,  # "gpt-4.1-mini" ok pour vision
+                model=OPENAI_MODEL,
                 input=[{
                     "role": "user",
                     "content": [
@@ -64,38 +91,36 @@ def call_openai_vision_json(data_url: str, prompt: str) -> str:
             try:
                 return r.output[0].content[0].text
             except Exception:
-                # certaines versions exposent output_text
                 return getattr(r, "output_text", "")
     except Exception as e:
         print("ℹ️ responses() non disponible / erreur:", repr(e))
 
-    # 2) Fallback Chat Completions (vision) — nécessite un modèle *-4o-*
-    try:
-        chat = client.chat.completions.create(
-            model=FALLBACK_MODEL,  # "gpt-4o-mini"
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}}
-                ]
-            }],
-            response_format={"type": "json_object"}
-        )
-        return chat.choices[0].message.content or ""
-    except Exception as e:
-        print("❌ chat.completions erreur:", repr(e))
-        raise
+    # 2) Fallback Chat Completions (vision)
+    chat = client.chat.completions.create(
+        model=FALLBACK_MODEL,  # "gpt-4o-mini"
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]
+        }],
+        response_format={"type": "json_object"}
+    )
+    return chat.choices[0].message.content or ""
 
 # ——— Extraction facture ———
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
+    # 0) Mode MOCK gratuit — active si GARANTIX_MOCK=1
+    if os.getenv("GARANTIX_MOCK") == "1":
+        return mock_payload()
+
     try:
         # 1) Lecture et vérifs
         blob = await file.read()
         if not blob:
             raise HTTPException(status_code=400, detail="Empty file")
-
         if len(blob) > MAX_UPLOAD_BYTES:
             raise HTTPException(
                 status_code=413,
@@ -140,6 +165,5 @@ async def extract(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        # Log côté serveur (Render → Logs) + message clair client
         print("❌ OpenAI/Server error:", repr(e))
         raise HTTPException(status_code=500, detail=f"Upstream error: {str(e)}")
