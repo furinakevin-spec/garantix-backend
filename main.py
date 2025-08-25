@@ -27,6 +27,13 @@ client = OpenAI(
     max_retries=1
 )
 
+@app.get("/config")
+def config():
+    return {
+        "mock_env": os.getenv("GARANTIX_MOCK"),
+        "mock_active": os.getenv("GARANTIX_MOCK") == "1"
+    }
+
 # ——— Endpoints de base ———
 @app.get("/")
 def hello():
