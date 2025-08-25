@@ -2,10 +2,11 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os, base64, mimetypes, json
 from openai import OpenAI
-import httpx  # ✅ pour capter les timeouts réseau
+import httpx  # pour gérer proprement les timeouts réseau
 
 app = FastAPI(title="Garantix Extract API")
 
+# CORS (utile pour l'app iOS et tests)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,28 +15,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Timeout plus court (Render coupe souvent après ~100s)
+# ——— Réglages sécurité/fiabilité ———
+MAX_UPLOAD_BYTES = 6 * 1024 * 1024  # ~6 Mo (évite 502 sur gros PDF/images)
+OPENAI_MODEL = "gpt-4.1-mini"
+
+# Client OpenAI avec timeout raisonnable pour Render
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    timeout=45.0,        # secondes (request total)
+    timeout=45.0,   # secondes (total request)
     max_retries=1
 )
 
-MAX_UPLOAD_BYTES = 6 * 1024 * 1024  # ~6 Mo pour éviter 502 sur gros PDF/images
+# ——— Endpoints de base ———
+@app.get("/")
+def hello():
+    return {"status": "ok", "message": "Garantix backend en ligne"}
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# ——— Utilitaire ———
 def to_data_url(content: bytes, filename: str) -> str:
     mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     b64 = base64.b64encode(content).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
+# ——— Extraction facture ———
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     try:
+        # 1) Lecture et vérifs
         blob = await file.read()
         if not blob:
             raise HTTPException(status_code=400, detail="Empty file")
 
-        # ✅ garde une borne haute (Render/Cloudflare n’aiment pas les très gros bodies)
         if len(blob) > MAX_UPLOAD_BYTES:
             raise HTTPException(
                 status_code=413,
@@ -49,6 +63,7 @@ async def extract(file: UploadFile = File(...)):
 
         data_url = to_data_url(blob, file.filename)
 
+        # 2) Prompt + appel OpenAI (format JSON strict)
         prompt = (
             "Analyse cette facture française. Retourne UNIQUEMENT un JSON avec: "
             "seller{name,legal_name,vat_id,siret,address,email,website}; "
@@ -61,7 +76,7 @@ async def extract(file: UploadFile = File(...)):
         )
 
         resp = client.responses.create(
-            model="gpt-4.1-mini",
+            model=OPENAI_MODEL,
             input=[{
                 "role": "user",
                 "content": [
@@ -72,11 +87,12 @@ async def extract(file: UploadFile = File(...)):
             response_format={"type": "json_object"}
         )
 
+        # 3) Parsing sécurisé
         text = resp.output[0].content[0].text  # string JSON
         try:
             parsed = json.loads(text)
         except Exception:
-            parsed = {"raw": text}
+            parsed = {"raw": text}  # renvoi brut si le JSON est imparfait
 
         return {"data": parsed}
 
@@ -86,5 +102,6 @@ async def extract(file: UploadFile = File(...)):
         print("⏱️ Timeout OpenAI:", repr(e))
         raise HTTPException(status_code=504, detail="Upstream timeout (try a smaller/clearer file)")
     except Exception as e:
+        # Log côté serveur (visible dans Render → Logs) + message clair client
         print("❌ OpenAI/Server error:", repr(e))
         raise HTTPException(status_code=500, detail=f"Upstream error: {str(e)}")
