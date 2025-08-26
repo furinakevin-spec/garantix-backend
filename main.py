@@ -1,163 +1,166 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+import base64
+import json
+from io import BytesIO
+from typing import List
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import os, base64, mimetypes, json
+from fastapi.responses import JSONResponse, PlainTextResponse
 from openai import OpenAI
-import httpx
 
-app = FastAPI(title="Garantix Extract API")
+from PIL import Image, ImageOps
+from pdf2image import convert_from_bytes
 
-# CORS pour l’app mobile
+# (Optionnel) HEIC -> Pillow
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+
+app = FastAPI(title="Garantix Extractor", version="1.0.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# Config
-MAX_UPLOAD_BYTES = 6 * 1024 * 1024  # 6 Mo
-OPENAI_MODEL = "gpt-4.1-mini"
-FALLBACK_MODEL = "gpt-4o-mini"
+client = OpenAI()  # nécessite OPENAI_API_KEY en variable d'env
 
-# Client OpenAI
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    timeout=45.0,
-    max_retries=1
-)
+ALLOWED_IMAGE_MIMES = {
+    "image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"
+}
 
-@app.get("/")
-def hello():
-    return {"status": "ok", "message": "Garantix backend en ligne 🚀"}
+def pil_to_data_url(img: Image.Image) -> str:
+    """Convertit une image PIL en data URL PNG base64 (robuste)."""
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
-@app.get("/health")
+def normalize_image(content: bytes) -> Image.Image:
+    """Ouvre l'image, corrige l'orientation EXIF, convertit en RGB, limite la taille."""
+    img = Image.open(BytesIO(content))
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    # Limite la taille pour coût/latence
+    max_side = 2000
+    w, h = img.size
+    if max(w, h) > max_side:
+        ratio = max_side / float(max(w, h))
+        img = img.resize((int(w * ratio), int(h * ratio)))
+    return img
+
+def pdf_to_images(pdf_bytes: bytes, max_pages: int = 3, dpi: int = 220) -> List[Image.Image]:
+    """Convertit un PDF en images (PNG) et limite à max_pages."""
+    pages = convert_from_bytes(pdf_bytes, fmt="png", dpi=dpi)
+    return pages[:max_pages]
+
+def build_prompt_schema() -> str:
+    schema = {
+        "vendor": "string",
+        "invoice_number": "string|null",
+        "date": "YYYY-MM-DD",
+        "currency": "string",
+        "subtotal": "number|null",
+        "tax": "number|null",
+        "total": "number",
+        "vat_id": "string|null",
+        "line_items": [
+            {"description": "string", "qty": "number|null", "unit_price": "number|null", "amount": "number|null"}
+        ],
+    }
+    return json.dumps(schema, ensure_ascii=False)
+
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "Garantix Extractor OK"
+
+@app.get("/healthz", response_class=JSONResponse)
 def health():
     return {"ok": True}
 
-@app.get("/config")
-def config():
-    return {
-        "mock_env": os.getenv("GARANTIX_MOCK"),
-        "mock_active": os.getenv("GARANTIX_MOCK") == "1"
-    }
-
-# -------- MOCK DATA --------
-def mock_payload():
-    return {
-        "data": {
-            "seller": {"name": "TEXIPOOL SASU"},
-            "purchase_date": "2025-08-20",
-            "currency": "EUR",
-            "totals": {"total_ttc": 778.64},
-            "items": [
-                {"product_name": "Enrouleur piscine 3-5 m", "line_total": 190.0,
-                 "warranty": {"duration_months": 24}, "confidence": 0.92},
-                {"product_name": "Bâche bulles 500µ Noir", "line_total": 530.96,
-                 "warranty": {"duration_months": 48}, "confidence": 0.88}
-            ],
-            "invoice_number": "290144",
-            "payment_method": "PayPal",
-            "confidence": 0.9
-        }
-    }
-
-def to_data_url(content: bytes, filename: str) -> str:
-    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    b64 = base64.b64encode(content).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
-
-# -------- OpenAI CALL --------
-def call_openai_vision_json(data_url: str, prompt: str) -> str:
-    try:
-        if hasattr(client, "responses"):  # API Responses
-            r = client.responses.create(
-                model=OPENAI_MODEL,
-                input=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "input_image", "image_url": data_url}
-                    ]
-                }],
-                response_format={"type": "json_object"}
-            )
-            try:
-                return r.output[0].content[0].text
-            except Exception:
-                return getattr(r, "output_text", "")
-    except Exception as e:
-        print("ℹ️ responses() non dispo:", repr(e))
-
-    # Fallback Chat Completions
-    chat = client.chat.completions.create(
-        model=FALLBACK_MODEL,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": data_url}}
-            ]
-        }],
-        response_format={"type": "json_object"}
-    )
-    return chat.choices[0].message.content or ""
-
-# -------- EXTRACT ENDPOINT --------
 @app.post("/extract")
-async def extract(
-    file: UploadFile = File(...),
-    mock: int = Query(default=0, description="1 = forcer le mode mock gratuit")
-):
-    # ✅ Mode mock
-    if mock == 1 or os.getenv("GARANTIX_MOCK") == "1":
-        return mock_payload()
+async def extract(file: UploadFile = File(...)):
+    """
+    Accepte: PDF et images (png/jpg/webp/heic).
+    Retour: JSON structuré des infos de facture.
+    """
+    ct = (file.content_type or "").lower()
+    name = (file.filename or "").lower()
 
-    try:
-        # Vérifs fichier
-        blob = await file.read()
-        if not blob:
-            raise HTTPException(400, "Empty file")
-        if len(blob) > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, "File too large")
+    # PDF -> to images
+    if ct == "application/pdf" or name.endswith(".pdf"):
+        pdf_bytes = await file.read()
+        try:
+            images = pdf_to_images(pdf_bytes, max_pages=3, dpi=220)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"PDF invalide ou non lisible: {e}")
+        contents = [{"type": "input_image", "image_url": pil_to_data_url(im)} for im in images]
 
-        # Vérif clé API
-        api_key = os.getenv("OPENAI_API_KEY") or ""
-        if not api_key.startswith(("sk-", "sk-proj-")):
-            raise HTTPException(500, "OPENAI_API_KEY missing/invalid")
+    # Images -> normalize
+    elif ct in ALLOWED_IMAGE_MIMES or name.endswith((".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif")):
+        raw = await file.read()
+        try:
+            img = normalize_image(raw)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Image invalide: {e}")
+        contents = [{"type": "input_image", "image_url": pil_to_data_url(img)}]
 
-        # DataURL
-        data_url = to_data_url(blob, file.filename)
-
-        # Prompt
-        prompt = (
-            "Analyse cette facture française. Retourne UNIQUEMENT un JSON avec: "
-            "seller{name,legal_name,vat_id,siret,address,email,website}; "
-            "purchase_date (YYYY-MM-DD); currency; "
-            "totals{subtotal_ht,tva_rate,tva_amount,total_ttc}; "
-            "items[{product_name,sku,qty,unit_price,line_total,product_photo_url,"
-            "warranty{duration_months,notes},confidence}]; "
-            "invoice_number; order_number; payment_method; confidence. "
-            "Si une info est absente, mets null. N'invente rien."
+    else:
+        raise HTTPException(
+            status_code=415,
+            detail="Type non supporté. Envoyez un PDF ou une image (png/jpg/webp/heic)."
         )
 
-        # Appel OpenAI
-        text = call_openai_vision_json(data_url, prompt)
-        if not text:
-            raise HTTPException(502, "Empty response from model")
+    system_instruction = (
+        "Tu es un extracteur de données de factures. "
+        "Analyse l'image/PDF et renvoie UNIQUEMENT un JSON valide respectant ce schéma. "
+        "Ne rajoute pas de texte autour du JSON."
+    )
+    user_instruction = (
+        "Extrait les informations de facture (vendeur, date, total, TVA, lignes) en JSON. "
+        f"Respecte ce schéma: {build_prompt_schema()} "
+        "Utilise un point comme séparateur décimal. Déduis la devise si affichée (€, EUR, $, etc.)."
+    )
 
-        # Parse JSON
+    try:
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[{
+                "role": "system",
+                "content": [{"type": "text", "text": system_instruction}]
+            },{
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_instruction}] + contents
+            }],
+            temperature=0
+        )
+
+        output_text = getattr(resp, "output_text", None)
+        if not output_text:
+            try:
+                output_text = resp.output[0].content[0].text  # fallback
+            except Exception:
+                raise HTTPException(status_code=502, detail="Réponse modèle inattendue.")
+
+        # Valide JSON
         try:
-            parsed = json.loads(text)
-        except Exception:
-            return {"data": {"raw": text}, "warning": "invalid JSON"}
+            data = json.loads(output_text)
+        except json.JSONDecodeError:
+            start = output_text.find("{")
+            end = output_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                data = json.loads(output_text[start:end+1])
+            else:
+                raise HTTPException(status_code=502, detail="Le modèle n'a pas renvoyé un JSON propre.")
 
-        return {"data": parsed}
+        return {"ok": True, "data": data}
 
-    except (httpx.TimeoutException, httpx.ReadTimeout):
-        raise HTTPException(504, "OpenAI timeout")
     except HTTPException:
         raise
     except Exception as e:
-        print("❌ Server error:", repr(e))
-        raise HTTPException(500, str(e))
+        # Propager clairement l’erreur amont au client (400 plutôt que 500 opaque)
+        raise HTTPException(status_code=400, detail=str(e))
