@@ -4,3 +4,4 @@ openai>=1.40.0
 pillow>=10.4.0
 pillow-heif>=0.16.0
 pdf2image>=1.17.0
+python-multipart>=0.0.9
