@@ -160,7 +160,8 @@ async def extract(file: UploadFile = File(...)):
             model="gpt-4o-mini",
             input=[{
                 "role": "system",
-                "content": [{"type": "text", "text": system_instruction}]
+                # APRÈS (correct)
+{"role":"system","content":[{"type":"input_text","text": system_instruction}]}
             },{
                 "role": "user",
                 "content": [{"type": "input_text", "text": user_instruction}] + contents
