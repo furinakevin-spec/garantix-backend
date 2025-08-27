@@ -161,10 +161,10 @@ async def extract(file: UploadFile = File(...)):
             input=[{
                 "role": "system",
                 # APRÈS (correct)
-{"role":"system","content":[{"type":"input_text","text": system_instruction}]}
+{"role":"system","content":[{"type":"input_text","input_text": system_instruction}]}
             },{
                 "role": "user",
-                "content": [{"type": "input_text", "text": user_instruction}] + contents
+                "content": [{"type": "input_text", "input_text": user_instruction}] + contents
             }],
             temperature=0
         )
