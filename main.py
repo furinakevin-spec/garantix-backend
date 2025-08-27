@@ -5,7 +5,7 @@ from typing import List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from openai import OpenAI
 
 from PIL import Image, ImageOps
@@ -40,12 +40,12 @@ def pil_to_data_url(img: Image.Image) -> str:
     return f"data:image/png;base64,{b64}"
 
 def normalize_image(content: bytes) -> Image.Image:
-    """Ouvre l'image, corrige l'orientation EXIF, convertit en RGB, limite la taille."""
+    """Ouvre l'image, corrige orientation EXIF, convertit en RGB, limite la taille."""
     img = Image.open(BytesIO(content))
     img = ImageOps.exif_transpose(img)
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGB")
-    # Limite la taille pour coût/latence
+    # Limite la taille
     max_side = 2000
     w, h = img.size
     if max(w, h) > max_side:
@@ -81,6 +81,35 @@ def root():
 @app.get("/healthz", response_class=JSONResponse)
 def health():
     return {"ok": True}
+
+@app.get("/upload", response_class=HTMLResponse)
+def upload_form():
+    return """
+    <html>
+      <head><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>body{font-family:-apple-system,Arial;margin:24px} input,button{font-size:18px}</style></head>
+      <body>
+        <h2>Uploader une facture (PDF/Image)</h2>
+        <form id="f" enctype="multipart/form-data" method="post" action="/extract">
+          <input type="file" name="file" accept="image/*,.pdf" />
+          <button type="submit">Extraire</button>
+        </form>
+        <pre id="out"></pre>
+        <script>
+        const f = document.getElementById('f');
+        const out = document.getElementById('out');
+        f.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          out.textContent = "Envoi...";
+          const data = new FormData(f);
+          const r = await fetch('/extract', { method:'POST', body:data });
+          const t = await r.text();
+          out.textContent = t;
+        });
+        </script>
+      </body>
+    </html>
+    """
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
@@ -142,7 +171,7 @@ async def extract(file: UploadFile = File(...)):
         output_text = getattr(resp, "output_text", None)
         if not output_text:
             try:
-                output_text = resp.output[0].content[0].text  # fallback
+                output_text = resp.output[0].content[0].text
             except Exception:
                 raise HTTPException(status_code=502, detail="Réponse modèle inattendue.")
 
@@ -162,5 +191,4 @@ async def extract(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        # Propager clairement l’erreur amont au client (400 plutôt que 500 opaque)
         raise HTTPException(status_code=400, detail=str(e))
